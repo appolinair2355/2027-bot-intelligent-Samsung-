@@ -24,6 +24,7 @@ class CardPredictor:
         self.predictions = {}
         self.inter_data = []
         self.smart_rules = []
+        self.deleted_tops = [] # Liste des 10 derniers tops supprimés
         self.collected_games = set()
         # Configuration automatique forcée
         self.target_channel_id = -1002682552255
@@ -48,9 +49,10 @@ class CardPredictor:
                 with open('inter_data.json', 'r') as f: self.inter_data = json.load(f)
             if os.path.exists('smart_rules.json'):
                 with open('smart_rules.json', 'r') as f: self.smart_rules = json.load(f)
+            if os.path.exists('deleted_tops.json'):
+                with open('deleted_tops.json', 'r') as f: self.deleted_tops = json.load(f)
             if os.path.exists('inter_mode_status.json'):
                 with open('inter_mode_status.json', 'r') as f: self.is_inter_mode_active = json.load(f).get('active', True)
-            # On ignore config_ids.json pour forcer les IDs codés en dur
         except Exception as e:
             logger.error(f"Error loading data: {e}")
 
@@ -59,6 +61,7 @@ class CardPredictor:
             with open('predictions.json', 'w') as f: json.dump(self.predictions, f)
             with open('inter_data.json', 'w') as f: json.dump(self.inter_data, f)
             with open('smart_rules.json', 'w') as f: json.dump(self.smart_rules, f)
+            with open('deleted_tops.json', 'w') as f: json.dump(self.deleted_tops, f)
             with open('inter_mode_status.json', 'w') as f: json.dump({'active': self.is_inter_mode_active}, f)
             with open('config_ids.json', 'w') as f:
                 json.dump({
@@ -140,7 +143,7 @@ class CardPredictor:
         for trigger, results in trigger_patterns.items():
             # Pour chaque déclencheur, on prend le résultat le plus fréquent
             suit, count = results.most_common(1)[0]
-            # On ne garde que si le déclencheur a été vu au moins 2 fois ou si on a peu de données
+            # On ne garde que si le déclencheur a été vu au moins 1 fois
             if count >= 1:
                 new_rules.append({
                     'trigger': trigger, 
@@ -155,23 +158,27 @@ class CardPredictor:
         self.smart_rules = new_rules
         if force_activate: self.is_inter_mode_active = True
         self._save_all_data()
+        logger.info(f"✨ Mise à jour des règles INTER effectuée ({len(new_rules)} règles)")
 
     def should_predict(self, text: str) -> Tuple[bool, Optional[int], Optional[str], bool]:
         if not self.auto_prediction_enabled: return False, None, None, False
         game_num = self.extract_game_number(text)
         if not game_num: return False, None, None, False
         
-        # RÈGLE : Écart de exactement 3 par rapport à la dernière prédiction
-        # Si on a prédit pour le jeu 900, on attend de voir le jeu 901 pour prédire pour 903 (903-900 = 3)
-        # Ou plus simplement: game_num (actuel) + 2 (cible) - last_predicted_game (cible précédente) == 3
+        # RÈGLE STRICTE : Écart de exactement 3 par rapport au dernier numéro prédit
         if self.last_predicted_game_number > 0:
             target_game = game_num + 2
             gap = target_game - self.last_predicted_game_number
             if gap != 3:
-                # logger.info(f"⏳ Écart non respecté: {gap} (attendu: 3). Cible: {target_game}, Précédent: {self.last_predicted_game_number}")
+                logger.info(f"🚫 Prédiction bloquée: Écart {gap} != 3 (Dernier: {self.last_predicted_game_number}, Actuel: {target_game})")
                 return False, None, None, False
-
-        # Extraction du groupe entre parenthèses pour l'analyse des déclencheurs
+        
+        # Vérifier si une prédiction est déjà en attente (pending) pour éviter d'en lancer deux
+        for p in self.predictions.values():
+            if p.get('status') == 'pending':
+                logger.info("🚫 Prédiction bloquée: Une prédiction est déjà en attente.")
+                return False, None, None, False
+        # Extraction du groupe entre parenthèses
         first_group_match = re.search(r'(?:\d+)?\(([^)]+)\)', text)
         if first_group_match:
             group_content = first_group_match.group(1)
@@ -199,6 +206,7 @@ class CardPredictor:
                 
                 # Chercher si une carte du message est dans le Top 4 d'une enseigne
                 best_rank = 99
+                rule_to_remove = -1
                 for card in cards_to_check:
                     card_clean = card.replace("❤️", "♥️")
                     for suit, top4 in top4_by_suit.items():
@@ -209,8 +217,27 @@ class CardPredictor:
                                 prediction = suit
                                 trigger_used = card_clean
                                 is_inter = True
+                
+                # Supprimer le top utilisé et l'ajouter à la liste des supprimés
+                if prediction:
+                    # Ne jamais utiliser deux fois même top pour prédire
+                    # On le retire des règles et on réinitialise ses collectes
+                    for i, rule in enumerate(self.smart_rules):
+                        if rule['trigger'] == trigger_used and rule['predict'] == prediction:
+                            # Ajouter aux supprimés (max 10)
+                            self.deleted_tops.insert(0, f"{trigger_used} avait prédit {prediction}")
+                            self.deleted_tops = self.deleted_tops[:10]
+                            
+                            # Supprimer toutes les données liées à ce déclencheur pour repartir à zéro (devient zéro)
+                            self.inter_data = [d for d in self.inter_data if d['declencheur'] != trigger_used]
+                            
+                            # Retirer de la liste des règles intelligentes
+                            self.smart_rules.pop(i)
+                            logger.info(f"🗑️ Top utilisé et remis à zéro : {trigger_used} -> {prediction}")
+                            self._save_all_data()
+                            break
         
-        # 2. SI LE MODE INTER EST INACTIF -> ON N'UTILISE QUE LE STATIQUE (sur la 1ère carte uniquement)
+        # 2. SI LE MODE INTER EST INACTIF -> ON N'UTILISE QUE LE STATIQUE
         else:
             info = self.get_first_card_info(text)
             if info:
@@ -281,7 +308,11 @@ class CardPredictor:
         
         if found_in_group:
             status = 'won'
-            symbol = f"✅{chr(0x30 + offset)}️⃣" # Génère ✅0️⃣, ✅1️⃣, ✅2️⃣
+            # symbol = f"✅{chr(0x30 + offset)}️⃣" # Génère ✅0️⃣, ✅1️⃣, ✅2️⃣
+            if offset == 0: symbol = "✅0️⃣"
+            elif offset == 1: symbol = "✅1️⃣"
+            elif offset == 2: symbol = "✅2️⃣"
+            else: symbol = "✅"
         else:
             # Si on est au dernier essai (offset 2) et que c'est toujours pas bon
             if offset >= 2:
@@ -297,7 +328,8 @@ class CardPredictor:
         return {
             'type': 'edit_message', 
             'message_id_to_edit': pred['message_id'], 
-            'new_message': f"🔵{target_game}🔵:{pred['predicted_costume']}statut :{symbol}"
+            'new_message': f"🔵{target_game}🔵:{pred['predicted_costume']}statut :{symbol}",
+            'offset': offset # Retourner l'offset pour la réaction
         }
 
     def get_session_report_preview(self) -> str:
@@ -312,6 +344,13 @@ class CardPredictor:
         total_collected = len(self.inter_data)
         
         message = f"🧠 **MODE INTER - {'✅ ACTIF' if is_active else '❌ INACTIF'}**\n\n"
+        
+        if self.deleted_tops:
+            message += "Les 10 dernier tops supprimer \n"
+            for dt in self.deleted_tops:
+                message += f"{dt}\n"
+            message += "\n"
+            
         message += f"📊 {len(self.smart_rules)} règles créées ({total_collected} jeux analysés):\n\n"
         
         # Regrouper par enseigne de prédiction
@@ -320,12 +359,15 @@ class CardPredictor:
             rules_by_suit[rule['predict']].append(rule)
             
         for suit in ['♠️', '♥️', '♦️', '♣️']:
-            if suit in rules_by_suit:
-                message += f"**Pour prédire {suit}:**\n"
+            suit_display = suit.replace("♥️", "❤️")
+            message += f"Pour prédire {suit_display}:\n"
+            if suit in rules_by_suit or suit.replace("❤️", "♥️") in rules_by_suit:
+                actual_suit = suit if suit in rules_by_suit else suit.replace("❤️", "♥️")
                 # On affiche les 4 meilleures règles par enseigne
-                for r in rules_by_suit[suit][:4]:
-                    message += f"  • {r['trigger']} ({r['count']}x)\n"
-                message += "\n"
+                for r in rules_by_suit[actual_suit][:4]:
+                    trigger_display = r['trigger'].replace("♥️", "❤️")
+                    message += f"  • {trigger_display} ({r['count']}x)\n"
+            message += "\n"
         
         kb = {'inline_keyboard': [[{'text': '🔄 Actualiser Analyse', 'callback_data': 'inter_apply'}]]}
         return message, kb

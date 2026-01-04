@@ -80,12 +80,7 @@ def reset_non_inter_predictions():
             # Files to remove
             files_to_clear = [
                 'predictions.json', 'inter_data.json', 'smart_rules.json',
-                'collected_games.json', 'sequential_history.json', 'pending_edits.json',
-                'quarantined_rules.json', 'last_prediction_time.json', 
-                'last_predicted_game_number.json', 'consecutive_fails.json',
-                'single_trigger_until.json', 'inter_mode_status.json',
-                'last_analysis_time.json', 'last_inter_update.json',
-                'last_report_sent.json', 'wait_until_next_update.json'
+                'collected_games.json', 'inter_mode_status.json'
             ]
             for file in files_to_clear:
                 if os.path.exists(file):
@@ -96,17 +91,8 @@ def reset_non_inter_predictions():
             predictor.inter_data = []
             predictor.smart_rules = []
             predictor.collected_games = set()
-            predictor.sequential_history = {}
-            predictor.pending_edits = {}
-            predictor.quarantined_rules = {}
             predictor.last_prediction_time = 0
             predictor.last_predicted_game_number = 0
-            predictor.consecutive_fails = 0
-            predictor.single_trigger_until = 0
-            predictor.last_analysis_time = 0
-            predictor.last_inter_update_time = 0
-            predictor.last_report_sent = {}
-            predictor.wait_until_next_update = 0
             predictor.is_inter_mode_active = True
             predictor._save_all_data()
             logger.info("🔄 Daily reset performed successfully.")
@@ -121,14 +107,13 @@ def send_startup_message():
             if not predictor.telegram_message_sender or not predictor.prediction_channel_id:
                 return
             
-            now = predictor.now()
-            last_update = predictor.get_inter_version()
+            now = datetime.now(pytz.timezone('Africa/Porto-Novo'))
             inter_active = "✅ ACTIF" if predictor.is_inter_mode_active else "❌ INACTIF"
             
             msg = (f"🎬 **LES PRÉDICTIONS REPRENNENT !**\n\n"
                    f"⏰ Heure de Bénin : {now.strftime('%H:%M:%S - %d/%m/%Y')}\n"
                    f"🧠 Mode Intelligent : {inter_active}\n"
-                   f"🔄 Mise à jour des règles : {last_update}\n\n"
+                   f"🔄 Mise à jour des règles : Toutes les 10 min\n\n"
                    f"👨‍💻 **Développeur** : Sossou Kouamé\n"
                    f"🎟️ **Code Promo** : Koua229")
             
@@ -138,10 +123,13 @@ def send_startup_message():
         logger.error(f"❌ Startup message error: {e}")
 
 def send_session_reports():
-    """Send reports by checking the predictor's logic"""
+    """Send reports"""
     try:
         if hasattr(telegram_bot, 'handlers') and telegram_bot.handlers.card_predictor:
-            telegram_bot.handlers.card_predictor.check_and_send_reports()
+            predictor = telegram_bot.handlers.card_predictor
+            report = predictor.get_session_report_preview()
+            if predictor.prediction_channel_id:
+                predictor.telegram_message_sender(predictor.prediction_channel_id, report)
     except Exception as e:
         logger.error(f"❌ Report error: {e}")
 
@@ -155,14 +143,14 @@ def setup_scheduler():
         scheduler.add_job(reset_non_inter_predictions, 'cron', hour=0, minute=59, timezone=benin_tz)
         
         # Periodic inter analysis every 10 minutes
-        # On utilise une fonction nommée globale pour éviter les problèmes de sérialisation
         scheduler.add_job(
             run_inter_analysis, 
             'interval', 
             minutes=10, 
             timezone=benin_tz,
             id='inter_analysis_job',
-            replace_existing=True
+            replace_existing=True,
+            next_run_time=datetime.now(benin_tz) # Lancer immédiatement au démarrage
         )
         
         # Reports at specific hours
